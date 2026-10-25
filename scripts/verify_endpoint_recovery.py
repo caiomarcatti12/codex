@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise a real Codex binary, isolated home, and two clients with a local mock model.
 
-Usage: python3 scripts/verify_endpoint_recovery.py /absolute/path/to/codex
+Usage: python3 scripts/verify_endpoint_recovery.py /absolute/path/to/codex [expected-version]
 No credentials, external model calls, or production sockets are used.
 """
 
@@ -44,7 +44,7 @@ class Client:
         assert header.startswith(b"HTTP/1.1 101 ") and expected in header
         self.sequence = 0
         self.events = []
-        self.rpc("initialize", {
+        self.initialize_result = self.rpc("initialize", {
             "clientInfo": {"name": "endpoint_recovery_smoke", "version": "1"},
             "capabilities": {"experimentalApi": True},
         })
@@ -168,6 +168,11 @@ def connect_when_ready(path, process):
 
 def main():
     binary = Path(sys.argv[1]).resolve(strict=True)
+    expected_version = sys.argv[2] if len(sys.argv) > 2 else None
+    if expected_version:
+        cli_version = subprocess.check_output([str(binary), "--version"], text=True).strip()
+        assert cli_version == f"codex-cli {expected_version}", cli_version
+        print(f"cli_version={expected_version}", flush=True)
     model = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Model)
     threading.Thread(target=model.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix="codex-endpoint-smoke-") as temporary:
@@ -196,6 +201,10 @@ stream_max_retries = 0
             path = home / "app-server-control/app-server-control.sock"
             first = connect_when_ready(path, process)
             clients.append(first)
+            if expected_version:
+                user_agent = first.initialize_result["userAgent"]
+                assert f"/{expected_version} " in user_agent, user_agent
+                print(f"initialize_version={expected_version}", flush=True)
             second = Client(path)
             clients.append(second)
             thread = first.rpc("thread/start", {"cwd": str(home)})["thread"]["id"]
