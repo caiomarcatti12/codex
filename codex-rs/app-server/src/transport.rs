@@ -28,12 +28,14 @@ pub(crate) use codex_app_server_transport::RemoteControlUnavailable;
 pub(crate) use codex_app_server_transport::TransportEvent;
 pub(crate) use codex_app_server_transport::acquire_app_server_startup_lock;
 pub use codex_app_server_transport::app_server_control_socket_path;
+pub(crate) use codex_app_server_transport::app_server_owner_lock_path;
 pub(crate) use codex_app_server_transport::app_server_startup_lock_path;
 pub(crate) use codex_app_server_transport::start_control_socket_acceptor;
 pub(crate) use codex_app_server_transport::start_remote_control;
 pub(crate) use codex_app_server_transport::start_stdio_connection;
 pub(crate) use codex_app_server_transport::start_websocket_acceptor;
 pub use codex_app_server_transport::take_remote_control_disabled_env;
+pub(crate) use codex_app_server_transport::try_acquire_app_server_owner_lock;
 pub use codex_app_server_transport::verified_local_daemon_socket;
 
 pub(crate) struct ConnectionState {

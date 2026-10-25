@@ -42,12 +42,14 @@ use crate::transport::RemoteControlPolicy;
 use crate::transport::RemoteControlStartConfig;
 use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
+use crate::transport::app_server_owner_lock_path;
 use crate::transport::app_server_startup_lock_path;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor;
 use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
+use crate::transport::try_acquire_app_server_owner_lock;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -668,6 +670,13 @@ pub async fn run_main_with_transport_options(
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
             let startup_lock = acquire_app_server_startup_lock(startup_lock_path).await?;
             Some(startup_lock)
+        }
+        _ => None,
+    };
+    let unix_socket_owner_lock = match &transport {
+        AppServerTransport::UnixSocket { .. } => {
+            let owner_lock_path = app_server_owner_lock_path(&codex_home)?;
+            Some(try_acquire_app_server_owner_lock(owner_lock_path).await?)
         }
         _ => None,
     };
@@ -1400,6 +1409,7 @@ pub async fn run_main_with_transport_options(
     for handle in transport_accept_handles {
         let _ = handle.await;
     }
+    drop(unix_socket_owner_lock);
 
     Ok(AppServerExit::Graceful)
 }
