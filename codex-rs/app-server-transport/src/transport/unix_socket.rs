@@ -74,30 +74,7 @@ pub async fn bind_private_daemon_socket(
     let socket_path = AbsolutePathBuf::from_absolute_path(socket_path)?;
     #[cfg(unix)]
     let (socket_path, rendezvous_path, mut startup_lock) = {
-        use std::os::unix::fs::MetadataExt;
-
-        if let Some(parent) = socket_path.as_path().parent() {
-            // The advertised path is only an alias; preserve existing parents.
-            match tokio::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(parent)
-                .await
-            {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-            let metadata = std::fs::metadata(parent)?;
-            if !metadata.is_dir()
-                || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
-                || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-            {
-                return Err(std::io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "socket parent must be owned by the user or root and prevent other users from replacing socket entries",
-                ));
-            }
-        }
+        prepare_rendezvous_parent(socket_path.as_path()).await?;
         codex_uds::prepare_shared_daemon_socket_directory()?;
         let physical_path = protected_socket_path(socket_path.as_path())?;
         let lock = acquire_removable_app_server_startup_lock(
@@ -149,6 +126,35 @@ pub async fn bind_private_daemon_socket(
     Ok((listener, socket_guard))
 }
 
+#[cfg(unix)]
+async fn prepare_rendezvous_parent(socket_path: &Path) -> IoResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Some(parent) = socket_path.parent() {
+        // The advertised path is only an alias; preserve existing parents.
+        match tokio::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(parent)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = std::fs::metadata(parent)?;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "socket parent must be owned by the user or root and prevent other users from replacing socket entries",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn run_control_socket_acceptor(
     mut listener: UnixListener,
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -157,11 +163,30 @@ async fn run_control_socket_acceptor(
     daemon_shutdown_access: DaemonShutdownAccess,
     compression: WebSocketCompression,
 ) {
+    #[cfg(unix)]
+    let mut socket_guard = socket_guard;
+    #[cfg(not(unix))]
     let _socket_guard = socket_guard;
+    let mut endpoint_check = tokio::time::interval(Duration::from_secs(1));
+    endpoint_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let stream = tokio::select! {
             _ = shutdown_token.cancelled() => {
                 break;
+            }
+            _ = endpoint_check.tick() => {
+                #[cfg(unix)]
+                match socket_guard.restore_missing_endpoint().await {
+                    Ok(Some(replacement)) => {
+                        // Accepted streams belong to independent connection tasks. Replacing
+                        // only the listener preserves their subscriptions and thread writers.
+                        listener = replacement;
+                        info!("restored missing app-server control socket without disconnecting clients");
+                    }
+                    Ok(None) => {}
+                    Err(err) => warn!("failed to restore app-server control socket: {err}"),
+                }
+                continue;
             }
             result = listener.accept() => {
                 match result {
@@ -559,6 +584,97 @@ pub struct DaemonSocketFileGuard {
     // Keep the directory pinned until after the socket file is removed in Drop.
     #[cfg(windows)]
     _directory_guard: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(unix)]
+impl DaemonSocketFileGuard {
+    /// Repair only missing entries. A different object at either path belongs
+    /// to someone else and must never be overwritten, even if it is unreachable.
+    pub(super) async fn restore_missing_endpoint(&mut self) -> IoResult<Option<UnixListener>> {
+        let socket_missing = match self
+            .socket_identity
+            .matches_path(self.socket_path.as_path())
+        {
+            Ok(true) => false,
+            Ok(false) => return Err(ErrorKind::AddrInUse.into()),
+            Err(err) if err.kind() == ErrorKind::NotFound => true,
+            Err(err) => return Err(err),
+        };
+        let alias_missing = self.rendezvous_is_missing()?;
+        if !socket_missing && !alias_missing {
+            return Ok(None);
+        }
+
+        // Revalidate the private directory before opening a repair lock or
+        // rebinding. A nonblocking lock keeps shutdown and existing clients responsive.
+        codex_uds::prepare_shared_daemon_socket_directory()?;
+        prepare_rendezvous_parent(self.rendezvous_path.as_path()).await?;
+        let lock_path = AbsolutePathBuf::from_absolute_path_checked(
+            self.socket_path.as_path().with_extension("lock"),
+        )?;
+        let mut repair_lock = match try_acquire_removable_app_server_startup_lock(lock_path) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let alias_missing = self.rendezvous_is_missing()?;
+        let replacement = match self
+            .socket_identity
+            .matches_path(self.socket_path.as_path())
+        {
+            Ok(true) => None,
+            Ok(false) => return Err(ErrorKind::AddrInUse.into()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // bind fails if an entry appears concurrently; never unlink it.
+                let listener = UnixListener::bind(self.socket_path.as_path()).await?;
+                let identity = SocketFileIdentity::from_path(self.socket_path.as_path())?;
+                if let Err(err) = set_control_socket_permissions(self.socket_path.as_path()).await {
+                    if identity
+                        .matches_path(self.socket_path.as_path())
+                        .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_file(self.socket_path.as_path());
+                    }
+                    return Err(err);
+                }
+                self.socket_identity = identity;
+                Some(listener)
+            }
+            Err(err) => return Err(err),
+        };
+
+        if alias_missing {
+            // symlink is create-only. In particular, do not remove an unexpected
+            // replacement or follow it to a different endpoint.
+            if let Err(err) = std::os::unix::fs::symlink(
+                self.socket_path.as_path(),
+                self.rendezvous_path.as_path(),
+            ) {
+                // Retain a newly bound listener even if publication fails. A
+                // later check can retry the alias without stranding that socket.
+                warn!("failed to restore app-server rendezvous alias: {err}");
+            } else {
+                info!("restored missing app-server rendezvous alias");
+            }
+        }
+
+        // Transfer cleanup responsibility while the repair lock is still held.
+        // Otherwise dropping the old startup guard could unlink this same lock file.
+        self._startup_lock.remove_on_drop = false;
+        repair_lock.remove_on_drop = true;
+        self._startup_lock = repair_lock;
+        self._startup_lock._file.unlock()?;
+        Ok(replacement)
+    }
+
+    fn rendezvous_is_missing(&self) -> IoResult<bool> {
+        match std::fs::read_link(self.rendezvous_path.as_path()) {
+            Ok(target) if target == self.socket_path.as_path() => Ok(false),
+            Ok(_) => Err(ErrorKind::AddrInUse.into()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(true),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 impl Drop for DaemonSocketFileGuard {

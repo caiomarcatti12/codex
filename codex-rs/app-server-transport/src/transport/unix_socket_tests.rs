@@ -346,6 +346,153 @@ async fn app_server_owner_lock_rejects_a_second_live_owner() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn control_socket_recovers_missing_endpoint_without_disconnecting_clients() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = test_socket_path(directory.path());
+    let (tx, _rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let acceptor = start_control_socket_acceptor(
+        path.clone(),
+        tx,
+        shutdown.clone(),
+        DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
+    )
+    .await
+    .unwrap();
+    let (mut first, _) = client_async(
+        "ws://localhost/rpc",
+        connect_to_socket(path.as_path()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    let physical = std::fs::read_link(path.as_path()).unwrap();
+
+    // Exercise alias loss, physical socket loss, and loss of both. Existing
+    // streams must survive each repair, while a new client can join the owner.
+    for (remove_alias, remove_socket) in [(true, false), (false, true), (true, true)] {
+        if remove_alias {
+            std::fs::remove_file(path.as_path()).unwrap();
+        }
+        if remove_socket {
+            std::fs::remove_file(&physical).unwrap();
+        }
+        let (mut second, _) = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = connect_to_socket(path.as_path()).await
+                    && let Ok(connection) = client_async("ws://localhost/rpc", stream).await
+                {
+                    break connection;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the live owner must restore its endpoint");
+
+        for websocket in [&mut first, &mut second] {
+            websocket
+                .send(WebSocketMessage::Ping(Bytes::from_static(
+                    b"still-connected",
+                )))
+                .await
+                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(1), websocket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                WebSocketMessage::Pong(Bytes::from_static(b"still-connected"))
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&physical).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        second.close(None).await.unwrap();
+    }
+
+    first.close(None).await.unwrap();
+    shutdown.cancel();
+    acceptor.await.unwrap();
+    assert!(!physical.exists());
+    assert!(!physical.with_extension("lock").exists());
+    assert!(std::fs::symlink_metadata(path.as_path()).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn endpoint_repair_preserves_replacements_and_does_not_wait_on_startup_lock() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = test_socket_path(directory.path());
+    let (_listener, mut guard) = super::bind_private_daemon_socket(path.as_path())
+        .await
+        .unwrap();
+    let physical = std::fs::read_link(path.as_path()).unwrap();
+
+    std::fs::remove_file(path.as_path()).unwrap();
+    let lock = try_acquire_removable_app_server_startup_lock(
+        AbsolutePathBuf::from_absolute_path(physical.with_extension("lock")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        timeout(Duration::from_secs(1), guard.restore_missing_endpoint())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(std::fs::symlink_metadata(path.as_path()).is_err());
+    drop(lock);
+    assert!(guard.restore_missing_endpoint().await.unwrap().is_none());
+    assert_eq!(std::fs::read_link(path.as_path()).unwrap(), physical);
+
+    // Refuse to publish into a parent whose permissions became unsafe.
+    std::fs::remove_file(path.as_path()).unwrap();
+    let parent = path.as_path().parent().unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        guard.restore_missing_endpoint().await.err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // An unexpected alias, even a dangling one, must not be replaced.
+    let other = directory.path().join("someone-else");
+    std::os::unix::fs::symlink(&other, path.as_path()).unwrap();
+    assert_eq!(
+        guard.restore_missing_endpoint().await.err().unwrap().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert_eq!(std::fs::read_link(path.as_path()).unwrap(), other);
+    std::fs::remove_file(path.as_path()).unwrap();
+    std::os::unix::fs::symlink(&physical, path.as_path()).unwrap();
+
+    // Nor may repair remove a replacement physical socket at our old path.
+    std::fs::remove_file(&physical).unwrap();
+    let replacement = tokio::net::UnixListener::bind(&physical).unwrap();
+    let inode = std::fs::metadata(&physical).unwrap().ino();
+    assert_eq!(
+        guard.restore_missing_endpoint().await.err().unwrap().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert_eq!(std::fs::metadata(&physical).unwrap().ino(), inode);
+    drop(guard);
+    tokio::net::UnixStream::connect(path.as_path())
+        .await
+        .unwrap();
+    drop(replacement);
+    std::fs::remove_file(&physical).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn stale_guard_does_not_unlink_a_replacement_physical_socket() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let rendezvous_path = test_socket_path(temp_dir.path());
@@ -368,6 +515,7 @@ async fn stale_guard_does_not_unlink_a_replacement_physical_socket() {
 
     drop(replacement);
     drop(old_listener);
+    std::fs::remove_file(&physical_path).expect("remove only this test's replacement socket");
 }
 
 #[cfg(unix)]
