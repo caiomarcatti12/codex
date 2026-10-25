@@ -5,6 +5,7 @@ use super::TransportEvent;
 use super::acquire_app_server_startup_lock;
 use super::app_server_control_socket_path;
 use super::start_control_socket_acceptor;
+use super::try_acquire_app_server_owner_lock;
 #[cfg(unix)]
 use super::unix_socket::acquire_removable_app_server_startup_lock;
 #[cfg(unix)]
@@ -316,6 +317,57 @@ async fn app_server_startup_lock_serializes_waiters() {
         .await
         .expect("second startup lock task should join")
         .expect("second startup lock should succeed");
+}
+
+#[tokio::test]
+async fn app_server_owner_lock_rejects_a_second_live_owner() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let lock_path = AbsolutePathBuf::from_absolute_path(
+        temp_dir
+            .path()
+            .join("app-server-control")
+            .join("app-server-owner.lock"),
+    )
+    .expect("owner lock path");
+    let first = try_acquire_app_server_owner_lock(lock_path.clone())
+        .await
+        .expect("first owner lock should succeed");
+    let error = try_acquire_app_server_owner_lock(lock_path.clone())
+        .await
+        .err()
+        .expect("second live owner must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+
+    drop(first);
+    try_acquire_app_server_owner_lock(lock_path)
+        .await
+        .expect("owner lock should be released with its process owner");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_guard_does_not_unlink_a_replacement_physical_socket() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let rendezvous_path = test_socket_path(temp_dir.path());
+    let (old_listener, old_guard) = super::bind_private_daemon_socket(&rendezvous_path)
+        .await
+        .expect("old socket should bind");
+    let physical_path = std::fs::read_link(rendezvous_path.as_path())
+        .expect("rendezvous should identify the physical socket");
+
+    std::fs::remove_file(&physical_path).expect("replace old physical path");
+    let replacement = tokio::net::UnixListener::bind(&physical_path)
+        .expect("replacement socket should bind at the same pathname");
+    drop(old_guard);
+
+    assert!(rendezvous_path.as_path().exists());
+    assert!(physical_path.exists());
+    tokio::net::UnixStream::connect(rendezvous_path.as_path())
+        .await
+        .expect("replacement must remain reachable through the rendezvous path");
+
+    drop(replacement);
+    drop(old_listener);
 }
 
 #[cfg(unix)]

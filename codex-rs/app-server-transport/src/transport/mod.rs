@@ -41,12 +41,14 @@ pub use remote_control::RemoteControlUnavailable;
 pub use remote_control::start_remote_control;
 pub use remote_control::take_remote_control_disabled_env;
 pub use stdio::start_stdio_connection;
+pub use unix_socket::AppServerOwnerLock;
 pub use unix_socket::AppServerStartupLock;
 pub use unix_socket::DaemonShutdownAccess;
 pub use unix_socket::DaemonSocketFileGuard;
 pub use unix_socket::acquire_app_server_startup_lock;
 pub use unix_socket::bind_private_daemon_socket;
 pub use unix_socket::start_control_socket_acceptor;
+pub use unix_socket::try_acquire_app_server_owner_lock;
 pub use unix_socket::verified_local_daemon_socket;
 pub use websocket::start_websocket_acceptor;
 
@@ -56,6 +58,7 @@ const OVERLOADED_ERROR_CODE: i64 = -32001;
 const APP_SERVER_CONTROL_SOCKET_DIR_NAME: &str = "app-server-control";
 const APP_SERVER_CONTROL_SOCKET_FILE_NAME: &str = "app-server-control.sock";
 const APP_SERVER_STARTUP_LOCK_FILE_NAME: &str = "app-server-startup.lock";
+const APP_SERVER_OWNER_LOCK_FILE_NAME: &str = "app-server-owner.lock";
 const DAEMON_RECOVERY_FILE_NAME: &str = "loaded-threads.json";
 
 pub fn daemon_recovery_file_path(codex_home: &Path) -> PathBuf {
@@ -77,6 +80,14 @@ pub fn app_server_startup_lock_path(codex_home: &Path) -> std::io::Result<Absolu
         codex_home
             .join(APP_SERVER_CONTROL_SOCKET_DIR_NAME)
             .join(APP_SERVER_STARTUP_LOCK_FILE_NAME),
+    )
+}
+
+pub fn app_server_owner_lock_path(codex_home: &Path) -> std::io::Result<AbsolutePathBuf> {
+    AbsolutePathBuf::from_absolute_path(
+        codex_home
+            .join(APP_SERVER_CONTROL_SOCKET_DIR_NAME)
+            .join(APP_SERVER_OWNER_LOCK_FILE_NAME),
     )
 }
 
